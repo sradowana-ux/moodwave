@@ -5,7 +5,7 @@ Run with:  python app.py
 Then open: http://localhost:7860
 
 Requirements:
-    pip install gradio transformers torch librosa soundfile
+    pip install gradio transformers torch librosa soundfile requests
 
 Model paths expected (relative to this file):
     MER_Project/audio_final_model/best_model/   <- fine-tuned Wav2Vec2
@@ -13,6 +13,13 @@ Model paths expected (relative to this file):
 
 If the fine-tuned text model doesn't exist the app falls back to the
 zero-shot SamLowe/roberta-base-go_emotions model automatically.
+
+The "Multimodal Fusion" tab combines text + audio mood scores (late
+fusion) and then calls spotify_client.py to turn that fused mood into an
+actual Spotify track recommendation. Set SPOTIFY_CLIENT_ID and
+SPOTIFY_CLIENT_SECRET as environment variables to enable that step
+(app-only Client Credentials auth — no user login needed, since this
+only uses the still-supported /v1/search endpoint).
 """
 
 import os
@@ -36,6 +43,8 @@ from transformers import (
     Wav2Vec2ForSequenceClassification,
     pipeline as hf_pipeline,
 )
+
+from spotify_client import search_tracks_for_mood, tracks_to_html, spotify_configured
 
 # ── Config ────────────────────────────────────────────────────────────────
 TARGET_LABELS   = ["anger", "fear", "joy", "neutral", "sadness"]
@@ -211,11 +220,17 @@ def run_audio_only(audio):
 
 
 def run_multimodal(text, audio, text_w, audio_w):
+    """
+    The "accumulation" step: fuse text + audio mood scores into one signal,
+    then turn that fused mood into an actual Spotify track recommendation
+    via spotify_client.search_tracks_for_mood (uses the still-supported
+    /v1/search endpoint with app-only Client Credentials auth).
+    """
     text_pred  = predict_text(text) if text and text.strip() else None
     audio_pred = predict_audio(audio) if (AUDIO_READY and audio) else None
 
     if text_pred is None and audio_pred is None:
-        return "Please provide text, audio, or both.", {}, "—", "—"
+        return "Please provide text, audio, or both.", {}, "—", "—", "", ""
 
     fused = fuse(text_pred, audio_pred, text_weight=text_w, audio_weight=audio_w)
     labels, values = scores_to_bar_data(fused["scores"])
@@ -228,10 +243,25 @@ def run_multimodal(text, audio, text_w, audio_w):
     audio_summary = (f"{MOOD_EMOJI.get(audio_pred['mood'],'')} {audio_pred['mood']} "
                      f"({audio_pred['confidence']*100:.0f}%)" if audio_pred else "—")
 
-    return result, gr.BarPlot.update(
-        value={"mood": labels, "score": values},
-        x="mood", y="score",
-    ), text_summary, audio_summary
+    try:
+        tracks = search_tracks_for_mood(mood, n=5)
+        tracks_html = tracks_to_html(tracks, mood)
+        playlist_md = f"### {emoji} Recommended for **{mood.upper()}**"
+    except RuntimeError as e:
+        tracks_html = f"<p style='color:#cc4444'>{e}</p>"
+        playlist_md = ""
+
+    return (
+        result,
+        gr.BarPlot.update(
+            value={"mood": labels, "score": values},
+            x="mood", y="score",
+        ),
+        text_summary,
+        audio_summary,
+        playlist_md,
+        tracks_html,
+    )
 
 
 # ── Build UI ──────────────────────────────────────────────────────────────
@@ -245,9 +275,11 @@ with gr.Blocks(title="Mood Detector", css=CSS) as demo:
     gr.Markdown(
         "# 🎵 Multimodal Emotion Recognition\n"
         "Predict mood from **text**, **speech**, or **both combined** using "
-        "RoBERTa (text) + Wav2Vec2 (audio) with late fusion.\n\n"
+        "RoBERTa (text) + Wav2Vec2 (audio) with late fusion — then get a "
+        "matching Spotify playlist.\n\n"
         f"> Text model: **{TEXT_MODE}** &nbsp;|&nbsp; "
-        f"Audio model: **{'loaded ✅' if AUDIO_READY else 'not found ⚠️'}**"
+        f"Audio model: **{'loaded ✅' if AUDIO_READY else 'not found ⚠️'}** &nbsp;|&nbsp; "
+        f"Spotify: **{'connected ✅' if spotify_configured() else 'not connected ⚠️'}**"
     )
 
     with gr.Tabs():
@@ -297,7 +329,7 @@ with gr.Blocks(title="Mood Detector", css=CSS) as demo:
                 "Performance on natural, spontaneous speech may be lower."
             )
 
-        # ── Tab 3: Multimodal fusion ─────────────────────────────────────
+        # ── Tab 3: Multimodal fusion + Spotify ───────────────────────────
         with gr.Tab("🔀 Multimodal Fusion"):
             with gr.Row():
                 mm_text  = gr.Textbox(label="Text input", lines=3,
@@ -317,10 +349,21 @@ with gr.Blocks(title="Mood Detector", css=CSS) as demo:
             with gr.Row():
                 txt_contrib = gr.Textbox(label="Text-only prediction", interactive=False)
                 aud_contrib = gr.Textbox(label="Audio-only prediction", interactive=False)
+
+            playlist_label = gr.Markdown("")
+            playlist_html  = gr.HTML("")
+
+            if not spotify_configured():
+                gr.Markdown(
+                    "> ⚠️ Spotify isn't connected — set `SPOTIFY_CLIENT_ID` / "
+                    "`SPOTIFY_CLIENT_SECRET` as environment variables to enable "
+                    "track recommendations here (app-only auth, no user login needed)."
+                )
+
             mm_btn.click(
                 run_multimodal,
                 inputs=[mm_text, mm_audio, text_w, audio_w],
-                outputs=[mm_result, mm_chart, txt_contrib, aud_contrib],
+                outputs=[mm_result, mm_chart, txt_contrib, aud_contrib, playlist_label, playlist_html],
             )
             gr.Markdown(
                 "> Default fusion weights (text=0.2, audio=0.8) are from the research paper. "
